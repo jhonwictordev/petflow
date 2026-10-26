@@ -1,10 +1,18 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { verifyPassword, signSessionToken, setSessionCookie, SessionPayload } from "@/lib/auth";
+import { verifyPassword, setSessionCookie, SessionPayload } from "@/lib/auth";
+import { checkRateLimit } from "@/lib/rateLimit";
+import { sanitizeEmail } from "@/lib/sanitization";
 
 export async function POST(req: Request) {
   try {
-    const { email, password } = await req.json();
+    // 1. Obtenção do IP do cliente para mitigação de força bruta
+    const forwardedFor = req.headers.get("x-forwarded-for");
+    const ip = forwardedFor ? forwardedFor.split(",")[0].trim() : "127.0.0.1";
+
+    const body = await req.json();
+    const email = sanitizeEmail(body.email);
+    const password = body.password;
 
     if (!email || !password) {
       return NextResponse.json(
@@ -13,8 +21,26 @@ export async function POST(req: Request) {
       );
     }
 
+    // 2. Proteção de Rate Limiting (Máximo 5 tentativas por minuto por IP/e-mail)
+    const rateLimitKey = `login:${ip}:${email}`;
+    const rateCheck = checkRateLimit(rateLimitKey, { windowMs: 60 * 1000, max: 5 });
+
+    if (!rateCheck.success) {
+      return NextResponse.json(
+        {
+          error: "Muitas tentativas de login consecutivas. Por favor, aguarde 1 minuto antes de tentar novamente.",
+        },
+        {
+          status: 429,
+          headers: {
+            "Retry-After": "60",
+          },
+        }
+      );
+    }
+
     const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase().trim() },
+      where: { email },
       include: {
         memberships: {
           include: { tenant: true },
@@ -31,6 +57,17 @@ export async function POST(req: Request) {
 
     const isMatch = await verifyPassword(password, user.passwordHash);
     if (!isMatch) {
+      // Registra tentativa com falha para auditoria
+      await prisma.auditLog.create({
+        data: {
+          action: "SECURITY_FAILED_LOGIN_ATTEMPT",
+          entityType: "User",
+          entityId: user.id,
+          ipAddress: ip,
+          details: JSON.stringify({ email }),
+        },
+      });
+
       return NextResponse.json(
         { error: "Credenciais inválidas. Verifique o e-mail e a senha informados." },
         { status: 401 }
